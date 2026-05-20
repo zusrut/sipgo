@@ -40,6 +40,7 @@ type TransportLayer struct {
 
 	// connectionReuse will force connection reuse when passing request
 	connectionReuse bool
+	readFilter      TransportReadFilter
 
 	// dnsPreferSRV does always SRV lookup first
 	dnsPreferSRV bool
@@ -65,6 +66,12 @@ func WithTransportLayerConnectionReuse(f bool) TransportLayerOption {
 func WithTransportLayerDNSLookupSRV(preferSRV bool) TransportLayerOption {
 	return func(l *TransportLayer) {
 		l.dnsPreferSRV = preferSRV
+	}
+}
+
+func WithTransportLayerReadFilter(f TransportReadFilter) TransportLayerOption {
+	return func(l *TransportLayer) {
+		l.readFilter = f
 	}
 }
 
@@ -130,25 +137,31 @@ func NewTransportLayer(
 		UDP: &TransportUDP{
 			log:             l.log.With("caller", "Transport<UDP>"),
 			connectionReuse: l.connectionReuse,
+			readFilter:      l.readFilter,
 		},
 		TCP: &TransportTCP{
 			log:             l.log.With("caller", "Transport<TCP>"),
 			connectionReuse: l.connectionReuse,
+			readFilter:      l.readFilter,
 		},
 		TLS: &TransportTLS{
 			TransportTCP: &TransportTCP{
 				log:             l.log.With("caller", "Transport<TLS>"),
 				connectionReuse: l.connectionReuse,
+				readFilter:      l.readFilter,
 			},
 		},
 		WS: &TransportWS{
-			log: l.log.With("caller", "Transport<WS>"),
+			log:        l.log.With("caller", "Transport<WS>"),
+			readFilter: l.readFilter,
 		},
 		// TODO. Using default dial tls, but it needs to configurable via client
 		WSS: &TransportWSS{
 			TransportWS: &TransportWS{
 				log:             l.log.With("caller", "Transport<WSS>"),
 				connectionReuse: l.connectionReuse,
+				DialURI:         func(host string) string { return "wss://" + host },
+				readFilter:      l.readFilter,
 			},
 		},
 	}
@@ -167,18 +180,28 @@ func NewTransportLayer(
 func (l *TransportLayer) withTransports(conf TransportsConfig) {
 	if conf.UDP != nil && l.udp == nil {
 		l.udp = conf.UDP
+		l.udp.connectionReuse = l.connectionReuse
+		l.udp.readFilter = l.readFilter
 	}
 	if conf.TCP != nil && l.tcp == nil {
 		l.tcp = conf.TCP
+		l.tcp.connectionReuse = l.connectionReuse
+		l.tcp.readFilter = l.readFilter
 	}
 	if conf.TLS != nil && l.tls == nil {
 		l.tls = conf.TLS
+		l.tls.connectionReuse = l.connectionReuse
+		l.tls.readFilter = l.readFilter
 	}
 	if conf.WS != nil && l.ws == nil {
 		l.ws = conf.WS
+		l.ws.connectionReuse = l.connectionReuse
+		l.ws.readFilter = l.readFilter
 	}
 	if conf.WSS != nil && l.wss == nil {
 		l.wss = conf.WSS
+		l.wss.connectionReuse = l.connectionReuse
+		l.wss.readFilter = l.readFilter
 	}
 }
 
@@ -377,7 +400,12 @@ func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Reque
 	}
 
 	raddr := Addr{}
-	if err := l.resolveRemoteAddr(ctx, network, req.Destination(), req.Recipient.Scheme, &raddr); err != nil {
+	dhost, dport, err := ParseAddr(req.Destination())
+	if err != nil {
+		return nil, fmt.Errorf("parse address failed for %s: %w", req.Destination(), err)
+	}
+
+	if err := l.resolveRemoteAddr(ctx, network, dhost, dport, req.Recipient.Scheme, &raddr); err != nil {
 		return nil, err
 	}
 
@@ -511,7 +539,7 @@ func (l *TransportLayer) serverRequestConnection(ctx context.Context, req *Reque
 		// IP:       net.ParseIP(uriNetIP(viaHost)),
 	}
 
-	if err := l.resolveRemoteAddr(ctx, network, uriNetIP(viaHost), req.Recipient.Scheme, &raddr); err != nil {
+	if err := l.resolveRemoteAddr(ctx, network, uriNetIP(viaHost), viaPort, req.Recipient.Scheme, &raddr); err != nil {
 		return nil, err
 	}
 
@@ -543,11 +571,7 @@ func (l *TransportLayer) serverRequestConnection(ctx context.Context, req *Reque
 	return c, err
 }
 
-func (l *TransportLayer) resolveRemoteAddr(ctx context.Context, network string, a string, sipScheme string, raddr *Addr) error {
-	host, port, err := ParseAddr(a)
-	if err != nil {
-		return fmt.Errorf("parse address failed for %s: %w", a, err)
-	}
+func (l *TransportLayer) resolveRemoteAddr(ctx context.Context, network string, host string, port int, sipScheme string, raddr *Addr) error {
 	raddr.Hostname = host
 	raddr.Port = port
 	if raddr.Port == 0 {

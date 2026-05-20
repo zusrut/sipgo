@@ -27,6 +27,8 @@ type TransactionLayer struct {
 	clientTransactions *transactionStore[*ClientTx]
 	serverTransactions *transactionStore[*ServerTx]
 
+	terminateOnConnClose bool
+
 	log *slog.Logger
 }
 
@@ -43,6 +45,17 @@ func WithTransactionLayerLogger(l *slog.Logger) TransactionLayerOption {
 func WithTransactionLayerUnhandledResponseHandler(f func(r *Response)) TransactionLayerOption {
 	return func(txl *TransactionLayer) {
 		txl.unRespHandler = f
+	}
+}
+
+// WithTransactionLayerTerminateOnConnClose enables termination of pending
+// client and server transactions when the underlying connection closes,
+// instead of waiting for timers to expire.
+//
+// Experimental
+func WithTransactionLayerTerminateOnConnClose() TransactionLayerOption {
+	return func(txl *TransactionLayer) {
+		txl.terminateOnConnClose = true
 	}
 }
 
@@ -63,11 +76,57 @@ func NewTransactionLayer(tpl *TransportLayer, options ...TransactionLayerOption)
 
 	//Send all transport messages to our transaction layer
 	tpl.OnMessage(txl.handleMessage)
+
+	notify := func(conn Connection) { txl.OnConnectionClose(conn) }
+	if tpl.tcp != nil {
+		tpl.tcp.onConnClose = notify
+	}
+	if tpl.tls != nil {
+		tpl.tls.onConnClose = notify
+	}
+	if tpl.ws != nil {
+		tpl.ws.onConnClose = notify
+	}
+	if tpl.wss != nil {
+		tpl.wss.onConnClose = notify
+	}
+
 	return txl
 }
 
 func (txl *TransactionLayer) OnRequest(h TransactionRequestHandler) {
 	txl.reqHandler = h
+}
+
+// OnConnectionClose is called when a reliable transport connection (TCP, TLS,
+// WS, WSS) is closed by the remote side or due to a read error.
+func (txl *TransactionLayer) OnConnectionClose(conn Connection) {
+	if txl.terminateOnConnClose {
+		txl.terminateClientTransactions(conn)
+		txl.terminateServerTransactions(conn)
+	}
+}
+
+func (txl *TransactionLayer) terminateClientTransactions(conn Connection) {
+	txl.clientTransactions.mu.RLock()
+	for _, tx := range txl.clientTransactions.items {
+		if tx.conn == conn {
+			go tx.spinFsmWithError(client_input_transport_err,
+				fmt.Errorf("connection closed: %w", ErrTransactionTransport))
+		}
+	}
+	txl.clientTransactions.mu.RUnlock()
+}
+
+func (txl *TransactionLayer) terminateServerTransactions(conn Connection) {
+	txl.serverTransactions.mu.RLock()
+	for _, tx := range txl.serverTransactions.items {
+		if tx.conn == conn {
+			go tx.spinFsmWithError(server_input_transport_err,
+				fmt.Errorf("connection closed: %w", ErrTransactionTransport))
+		}
+	}
+	txl.serverTransactions.mu.RUnlock()
 }
 
 // handleMessage is entry for handling requests and responses from transport
@@ -103,19 +162,23 @@ func (txl *TransactionLayer) handleRequest(req *Request) error {
 		// For now we only match INVITE
 		key, err := makeServerTxKey(req, INVITE)
 		if err != nil {
+			txl.rejectMalformedRequest(req, err)
 			return fmt.Errorf("make key failed: %w", err)
 		}
 
 		tx, exists := txl.getServerTx(key)
 		if exists {
-			// If ok this should terminate this transaction
-			if err := tx.Receive(req); err != nil {
-				return fmt.Errorf("failed to receive req: %w", err)
-			}
-
-			// Reuse connection and send 200 for CANCEL
+			// Send 200 OK for CANCEL first, then terminate the INVITE.
+			// The CANCEL client transaction retransmits until it receives
+			// a response; sending 200 OK before the 487 ensures the UAC
+			// stops retransmitting immediately.
 			if err := tx.conn.WriteMsg(NewResponseFromRequest(req, StatusOK, "OK", nil)); err != nil {
 				return fmt.Errorf("Failed to respond 200 for CANCEL: %w", err)
+			}
+
+			// Now let the FSM terminate the INVITE transaction (sends 487)
+			if err := tx.Receive(req); err != nil {
+				return fmt.Errorf("failed to receive req: %w", err)
 			}
 			return nil
 		}
@@ -124,10 +187,42 @@ func (txl *TransactionLayer) handleRequest(req *Request) error {
 
 	key, err := makeServerTxKey(req, "")
 	if err != nil {
+		txl.rejectMalformedRequest(req, err)
 		return fmt.Errorf("make key failed: %w", err)
 	}
 
 	return txl.serverTxRequest(req, key)
+}
+
+// rejectMalformedRequest sends a stateless 400 Bad Request response when a
+// request is too malformed to create a transaction (e.g. missing CSeq or Via).
+//
+// Per RFC 3261 Section 8.2:
+//
+//	If a UAS does not understand a header field in a request (that is,
+//	the header field is not defined in this specification or in any
+//	installed extensions), the server MUST ignore that header field and
+//	continue processing the message.
+//
+// And Section 16.3 (Request Validation):
+//
+//	If the request contains a malformed header field that the proxy
+//	requires, the proxy SHOULD return a 400 (Bad Request) response.
+//
+// Without this, the sender retransmits indefinitely because it never
+// receives any response.
+func (txl *TransactionLayer) rejectMalformedRequest(req *Request, reason error) {
+	// Build a minimal 400 response from whatever headers the request has.
+	// NewResponseFromRequest safely skips nil CSeq, From, To, Call-ID.
+	res := NewResponseFromRequest(req, StatusBadRequest, "Bad Request", nil)
+
+	if err := txl.tpl.WriteMsg(res); err != nil {
+		txl.log.Error("Failed to send stateless 400 for malformed request",
+			"error", err,
+			"reason", reason.Error(),
+			"req", req.StartLine(),
+		)
+	}
 }
 
 func (txl *TransactionLayer) serverTxRequest(req *Request, key string) error {

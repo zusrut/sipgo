@@ -23,6 +23,7 @@ type TransportUDP struct {
 	pool            *connectionPool
 	log             *slog.Logger
 	connectionReuse bool
+	readFilter      TransportReadFilter
 }
 
 func (t *TransportUDP) init(par *Parser) {
@@ -132,9 +133,13 @@ func (t *TransportUDP) readListenerConnection(conn *UDPConnection, laddr string,
 	var lastRaddr string
 	// NOTE: consider to refactor, but for cleanup
 	// We are reusing UDP listener as dial connection
-	acceptedAddr := make([]string, 0, 1000)
+	acceptedAddr := make(map[string]struct{})
 	defer func() {
-		t.pool.DeleteMultiple(acceptedAddr)
+		addrs := make([]string, 0, len(acceptedAddr))
+		for addr := range acceptedAddr {
+			addrs = append(addrs, addr)
+		}
+		t.pool.DeleteMultiple(addrs)
 	}()
 
 	for {
@@ -153,11 +158,27 @@ func (t *TransportUDP) readListenerConnection(conn *UDPConnection, laddr string,
 			continue
 		}
 		rastr := raddr.String()
+		if t.readFilter != nil {
+			filtered, err := t.readFilter(TransportReadProps{
+				Transport:  t.Network(),
+				LocalAddr:  conn.LocalAddr(),
+				RemoteAddr: raddr,
+			}, data)
+			if err != nil {
+				t.log.Error("Read filter error", "laddr", laddr, "raddr", rastr, "error", err)
+				return
+			}
+			if len(filtered) == 0 {
+				continue
+			}
+			data = filtered
+		}
+
 		if lastRaddr != rastr {
 			// In most cases we are in single connection mode so no need to keep adding in pool
 			// In case of server and multiple UDP listeners, this makes sure right one is used
 			t.pool.Add(rastr, conn)
-			acceptedAddr = append(acceptedAddr, rastr)
+			acceptedAddr[rastr] = struct{}{}
 		}
 
 		t.parseAndHandle(data, rastr, handler)

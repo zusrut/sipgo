@@ -17,10 +17,10 @@ import (
 func TestUnmarshalParams(t *testing.T) {
 	s := "transport=tls;lr"
 	params := HeaderParams{}
-	UnmarshalHeaderParams(s, ';', '?', params)
+	UnmarshalHeaderParams(s, ';', '?', &params)
 	assert.Equal(t, 2, len(params))
-	assert.Equal(t, "tls", params["transport"])
-	assert.Equal(t, "", params["lr"])
+	assert.Equal(t, "tls", params.GetOr("transport", ""))
+	assert.Equal(t, "", params.GetOr("lr", "<missing>"))
 }
 
 func testParseHeader(t *testing.T, parser *Parser, header string) Header {
@@ -64,6 +64,53 @@ func TestParseHeaders(t *testing.T) {
 			assert.Equal(t, "Via: SIP/2.0/UDP 192.0.2.2;branch=390skdjuw", hstr)
 			via := h.(*ViaHeader)
 			assert.Equal(t, "UDP", via.Transport)
+		})
+
+		t.Run("IPv6", func(t *testing.T) {
+			// Issue surfaced as livekit/sip#640: viaStateHost previously
+			// walked colons greedily and confused IPv6 separators with the
+			// host:port boundary, producing strconv.Atoi parse errors on
+			// IPv6 Via headers.
+			cases := []struct {
+				name      string
+				header    string
+				wantHost  string
+				wantPort  int
+				wantTrans string
+			}{
+				{
+					name:      "with_port",
+					header:    "Via: SIP/2.0/TCP [2001:67c:b0c:5::192]:5060;branch=z9hG4bKB5mrcD1BXK68a",
+					wantHost:  "2001:67c:b0c:5::192",
+					wantPort:  5060,
+					wantTrans: "TCP",
+				},
+				{
+					name:      "no_port",
+					header:    "Via: SIP/2.0/TCP [2001:67c:b0c:5::192];branch=z9hG4bKB5mrcD1BXK68a",
+					wantHost:  "2001:67c:b0c:5::192",
+					wantPort:  0,
+					wantTrans: "TCP",
+				},
+				{
+					name:      "loopback",
+					header:    "Via: SIP/2.0/UDP [::1]:5060;branch=z9hG4bK1234",
+					wantHost:  "::1",
+					wantPort:  5060,
+					wantTrans: "UDP",
+				},
+			}
+
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					h := testParseHeader(t, parser, tc.header)
+					via, ok := h.(*ViaHeader)
+					require.True(t, ok, "expected ViaHeader, got %T", h)
+					assert.Equal(t, tc.wantHost, via.Host, "host mismatch")
+					assert.Equal(t, tc.wantPort, via.Port, "port mismatch")
+					assert.Equal(t, tc.wantTrans, via.Transport, "transport mismatch")
+				})
+			}
 		})
 	})
 
@@ -128,7 +175,7 @@ func TestParseHeaders(t *testing.T) {
 
 		for header, expected := range map[string]contactFields{
 			"Contact: <sip:2000@dkanrjsk.invalid>;+sip.ice;reg-id=1;+sip.instance=\"<urn:uuid:a369bd8d-f310-4a95-8328-98c7ed3d5439>\";expires=300": {
-				address: "sip:2000@dkanrjsk.invalid", headers: map[string]string{"+sip.ice": "", "reg-id": "1", "+sip.instance": "\"<urn:uuid:a369bd8d-f310-4a95-8328-98c7ed3d5439>\"", "expires": "300"}},
+				address: "sip:2000@dkanrjsk.invalid", headers: HeaderParams{{"+sip.ice", ""}, {"reg-id", "1"}, {"+sip.instance", "\"<urn:uuid:a369bd8d-f310-4a95-8328-98c7ed3d5439>\""}, {"expires", "300"}}},
 			// "m: <sip:test@10.5.0.1:50267;transport=TCP;ob>;reg-id=1;+instance=\"<urn:uuid:00000000-0000-0000-0000-0000eb83488d>\"": {
 			// 	address: "sip:test@10.5.0.1:50267;transport=TCP;ob", headers: map[string]string{"reg-id": "1", "+instance": "\"<urn:uuid:00000000-0000-0000-0000-0000eb83488d>\""}},
 		} {
@@ -366,6 +413,41 @@ func TestParseRequest(t *testing.T) {
 	assert.Equal(t, msg.String(), msgstr)
 }
 
+func TestParseRequestFoldedHeaders(t *testing.T) {
+	rawMsg := []string{
+		"INVITE sip:bob@127.0.0.1:5060 SIP/2.0",
+		"Via: SIP/2.0/UDP 127.0.0.2:5060;",
+		"\tbranch=z9hG4bK-folded",
+		"From: \"Alice\" <sip:alice@127.0.0.2:5060>;tag=1928301774",
+		"To: \"Bob\" <sip:bob@127.0.0.1:5060>",
+		"Call-ID: gotest-folded",
+		"CSeq: 1",
+		" INVITE",
+		"X-Long: alpha  ",
+		"\t beta",
+		" gamma  ",
+		"Content-Length: 0",
+		"",
+		"",
+	}
+
+	parser := NewParser()
+	msg, err := parser.ParseSIP([]byte(strings.Join(rawMsg, "\r\n")))
+	require.NoError(t, err)
+
+	via := msg.Via()
+	require.NotNil(t, via)
+	assert.Equal(t, "z9hG4bK-folded", via.Params.GetOr("branch", ""))
+
+	cseq := msg.CSeq()
+	require.NotNil(t, cseq)
+	assert.Equal(t, INVITE, cseq.MethodName)
+
+	headers := msg.GetHeaders("X-Long")
+	require.Len(t, headers, 1)
+	assert.Equal(t, "alpha beta gamma", headers[0].Value())
+}
+
 func TestParseResponse(t *testing.T) {
 	rawMsg := []string{
 		"SIP/2.0 180 Ringing",
@@ -392,12 +474,12 @@ func TestParseResponse(t *testing.T) {
 
 	// Make sure via ref is correct set
 	via := r.Via()
-	assert.Equal(t, "z9hG4bK.VYWrxJJyeEJfngAjKXELr8aPYuX8tR22", via.Params["branch"])
+	assert.Equal(t, "z9hG4bK.VYWrxJJyeEJfngAjKXELr8aPYuX8tR22", via.Params.GetOr("branch", ""))
 
 	// Check all vias branch
 	vias := r.GetHeaders("via")
-	assert.Equal(t, "z9hG4bK.VYWrxJJyeEJfngAjKXELr8aPYuX8tR22", vias[0].(*ViaHeader).Params["branch"])
-	assert.Equal(t, "z9hG4bK-543537-1-0", vias[1].(*ViaHeader).Params["branch"])
+	assert.Equal(t, "z9hG4bK.VYWrxJJyeEJfngAjKXELr8aPYuX8tR22", vias[0].(*ViaHeader).Params.GetOr("branch", ""))
+	assert.Equal(t, "z9hG4bK-543537-1-0", vias[1].(*ViaHeader).Params.GetOr("branch", ""))
 	// Check no comma present
 	assert.False(t, strings.Contains(vias[1].String(), ","))
 

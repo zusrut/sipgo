@@ -11,11 +11,10 @@ It comes with [SIP stack](/sip/README.md) ([RFC 3261](https://datatracker.ietf.o
 
 
 **Libs on top of sipgo:**
-- ***diago*** [github.com/emiago/diago](https://github.com/emiago/diago): Full VOIP library/framework with media stack 
+- ***Diago*** [github.com/emiago/diago](https://github.com/emiago/diago): Full VOIP library/framework with media stack (Active development)
 
-**Tools/Service:**
-- <img width="20" src="https://github.com/emiago/diagox/raw/main/images/diagox-icon-blue.png"> [github.com/emiago/diagox](https://github.com/emiago/diagox) simple Ingress/Egress and Registrar for SIP/RTP scaling
-- <img width="20" src="https://github.com/emiago/gophone/raw/main/images/g2.png"> [github.com/emiago/gophone](https://github.com/emiago/gophone) CLI softphone for easy testing 
+**Tools developed on top:**
+- ***Gophone*** [github.com/emiago/gophone](https://github.com/emiago/gophone) CLI softphone for easy testing 
 
 
 Fetch lib with:
@@ -53,7 +52,7 @@ be seperated from parsing or not built into library.
 
 - Stateful proxy [example/proxysip](example/proxysip)  
 - Register with authentication [example/register](example/register)  
-- RTP echo with sipgox [example/dialog](https://github.com/emiago/sipgox/tree/main/echome)
+- Call and media with diago examples [diago/examples](https://github.com/emiago/diago/tree/main/examples)
 
 Also thanks to [pion](https://github.com/pion/webrtc) project sharing this example of using SIPgo with webrtc:
 - https://github.com/pion/example-webrtc-applications/tree/master/sip-to-webrtc  original post [on X](https://twitter.com/_pion/status/1742955942314913958)
@@ -61,7 +60,7 @@ Also thanks to [pion](https://github.com/pion/webrtc) project sharing this examp
 
 
 
-## Performance :rocket
+## Performance
 
 SIPgo was proven that can excel in performance compared to some other configured base proxy solutions. 
 
